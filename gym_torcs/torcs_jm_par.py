@@ -483,60 +483,245 @@ if __name__ == "__main__":
     C.shutdown()
 
 
-
-#############################################
-# MODULAR DRIVE LOGIC WITH USER PARAMETERS  #
-#############################################
-
-import math
-
 # ================= USER CONFIGURABLE PARAMETERS =================
-TARGET_SPEED = 200  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
-STEER_GAIN = 50     # Steering sensitivity. Higher values make the car turn more aggressively.
-CENTERING_GAIN = 0.60  # How strongly the car corrects its position toward the center of the track.
-BRAKE_THRESHOLD = 0.5  # Angle threshold for braking. Lower values brake earlier.
-GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]  # Speed thresholds for gear shifting.
-ENABLE_TRACTION_CONTROL = True  # Toggle traction control system.
+TARGET_SPEED = 95           # Safe base speed for Corkscrew
+STEER_GAIN = 22             # Steering sensitivity
+CENTERING_GAIN = 0.20       # Correction toward center
+GEAR_SPEEDS = [0, 40, 70, 100, 130, 160]  # Gear speed thresholds
+ENABLE_TRACTION_CONTROL = True
+MAX_STEER_CHANGE = 0.15     # Maximum steering change per step
+STEER_DAMPING = 0.3         # Base steering damping (0 < STEER_DAMPING <= 1)
+MIN_SPEED = 20              # Minimum speed to avoid stopping
 
-# ================= HELPER FUNCTIONS =================
+# ================= UTILITY FUNCTIONS =================
+def clip(v, lo, hi):
+    return max(lo, min(v, hi))
+
+def destringify(s):
+    if not s: return s
+    if isinstance(s, str):
+        try: return float(s)
+        except ValueError: return s
+    elif isinstance(s, list):
+        if len(s) < 2: return destringify(s[0])
+        return [destringify(i) for i in s]
+
+def bargraph(x, mn, mx, w, c='X'):
+    if not w: return ''
+    x = clip(x, mn, mx)
+    tx = mx - mn
+    upw = tx / float(w)
+    nnc = int((x - mn)/upw)*c
+    return '[%s]' % nnc
+
+# ================= CLIENT CLASSES =================
+class ServerState:
+    def __init__(self):
+        self.servstr = ""
+        self.d = {}
+
+    def parse_server_str(self, server_string):
+        self.servstr = server_string.strip()[:-1]
+        sslisted = self.servstr.strip().lstrip('(').rstrip(')').split(')(')
+        for i in sslisted:
+            w = i.split(' ')
+            self.d[w[0]] = destringify(w[1:])
+
+class DriverAction:
+    def __init__(self):
+        self.d = {'accel':0.2,'brake':0,'clutch':0,'gear':1,
+                  'steer':0,'focus':[-90,-45,0,45,90],'meta':0}
+
+    def clip_to_limits(self):
+        self.d['steer']= clip(self.d['steer'], -1, 1)
+        self.d['brake']= clip(self.d['brake'], 0, 1)
+        self.d['accel']= clip(self.d['accel'], 0, 1)
+        self.d['clutch']= clip(self.d['clutch'], 0, 1)
+        if self.d['gear'] not in [-1,0,1,2,3,4,5,6]: self.d['gear']=0
+        if self.d['meta'] not in [0,1]: self.d['meta']=0
+        if not isinstance(self.d['focus'], list) or min(self.d['focus'])<-180 or max(self.d['focus'])>180:
+            self.d['focus'] = 0
+
+    def __repr__(self):
+        self.clip_to_limits()
+        out = ""
+        for k in self.d:
+            out += '('+k+' '
+            v = self.d[k]
+            if not isinstance(v, list):
+                out += '%.3f' % v
+            else:
+                out += ' '.join([str(x) for x in v])
+            out += ')'
+        return out
+
+class Client:
+    def __init__(self,H=None,p=None,i=None,e=None,t=None,s=None,d=None,vision=False):
+        self.vision = vision
+        self.host= 'localhost'
+        self.port= 3001
+        self.sid= 'SCR'
+        self.maxEpisodes=1
+        self.trackname= 'unknown'
+        self.stage= 3
+        self.debug= False
+        self.maxSteps= 100000
+        self.parse_the_command_line()
+        if H: self.host= H
+        if p: self.port= p
+        if i: self.sid= i
+        if e: self.maxEpisodes= e
+        if t: self.trackname= t
+        if s: self.stage= s
+        if d: self.debug= d
+        self.S= ServerState()
+        self.R= DriverAction()
+        self.setup_connection()
+
+    def setup_connection(self):
+        try:
+            self.so= socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except socket.error:
+            sys.exit(-1)
+        self.so.settimeout(1)
+        n_fail = 5
+        while True:
+            a= "-45 -19 -12 -7 -4 -2.5 -1.7 -1 -.5 0 .5 1 1.7 2.5 4 7 12 19 45"
+            initmsg='%s(init %s)' % (self.sid,a)
+            try: self.so.sendto(initmsg.encode(), (self.host, self.port))
+            except: sys.exit(-1)
+            sockdata= ""
+            try:
+                sockdata,addr= self.so.recvfrom(data_size)
+                sockdata = sockdata.decode('utf-8')
+            except socket.error:
+                print("Waiting for server on %d..." % self.port)
+                n_fail -= 1
+                if n_fail < 0:
+                    os.system('pkill torcs')
+                    time.sleep(1)
+                    cmd = 'torcs -nofuel -nodamage -nolaptime'
+                    if self.vision: cmd += ' -vision'
+                    os.system(cmd + ' &')
+                    time.sleep(1)
+                    os.system('sh autostart.sh')
+                    n_fail = 5
+            if '***identified***' in sockdata:
+                print("Client connected on %d." % self.port)
+                break
+
+    def parse_the_command_line(self):
+        try:
+            (opts, args) = getopt.getopt(sys.argv[1:], 'H:p:i:m:e:t:s:dhv',
+                                         ['host=','port=','id=','steps=','episodes=','track=','stage=','debug','help','version'])
+        except getopt.error as why:
+            print(why); sys.exit(-1)
+        for opt in opts:
+            if opt[0] in ('-H','--host'): self.host= opt[1]
+            if opt[0] in ('-p','--port'): self.port= int(opt[1])
+            if opt[0] in ('-i','--id'): self.sid= opt[1]
+            if opt[0] in ('-e','--episodes'): self.maxEpisodes= int(opt[1])
+            if opt[0] in ('-t','--track'): self.trackname= opt[1]
+            if opt[0] in ('-s','--stage'): self.stage= int(opt[1])
+            if opt[0] in ('-m','--steps'): self.maxSteps= int(opt[1])
+            if opt[0] in ('-d','--debug'): self.debug= True
+
+    def get_servers_input(self):
+        if not self.so: return
+        while True:
+            try:
+                sockdata, addr = self.so.recvfrom(data_size)
+                sockdata = sockdata.decode('utf-8')
+            except socket.error: continue
+            if '***shutdown***' in sockdata or '***restart***' in sockdata:
+                self.shutdown()
+                return
+            if not sockdata: continue
+            self.S.parse_server_str(sockdata)
+            break
+
+    def respond_to_server(self):
+        if not self.so: return
+        self.so.sendto(repr(self.R).encode(), (self.host, self.port))
+
+    def shutdown(self):
+        if self.so: self.so.close(); self.so=None
+
+# ================= HELPER DRIVE FUNCTIONS =================
 def calculate_steering(S):
-    steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
-    return max(-1, min(1, steer))
+    steer_gain = STEER_GAIN
+    if abs(S['trackPos']) > 0.9: steer_gain *= 0.5
+    steer = (S['angle'] * steer_gain / PI) - (S['trackPos'] * CENTERING_GAIN)
+    return clip(steer, -1, 1)
 
-def calculate_throttle(S, R):
-    if S['speedX'] < TARGET_SPEED - (R['steer'] * 2.5):
-        accel = min(1.0, R['accel'] + 0.4)
-    else:
-        accel = max(0.0, R['accel'] - 0.2)
-    if S['speedX'] < 10:
-        accel += 1 / (S['speedX'] + 0.1)
-    return max(0.0, min(1.0, accel))
+def calculate_dynamic_speed(S):
+    front_track = S['track'][:9]
+    min_front = min(front_track)
+    reduction_factor = max(0.3, min(1.0, min_front/100))
+    target = TARGET_SPEED * reduction_factor
+    if abs(S['trackPos']) > 0.9: target *= 0.5
+    return max(MIN_SPEED, target)
 
-def apply_brakes(S):
-    return 0.3 if abs(S['angle']) > BRAKE_THRESHOLD else 0.0
+def calculate_throttle(S, R, target_speed):
+    accel = R['accel']
+    speed_error = target_speed - S['speedX']
+    accel += speed_error / 50.0
+    return clip(accel, 0.0, 1.0)
+
+def apply_brakes(S, target_speed):
+    brake = 0.0
+    front_track = S['track'][:9]
+    min_front = min(front_track)
+    if S['speedX'] > target_speed: brake = (S['speedX'] - target_speed)/20.0
+    if min_front < 50: brake = max(brake, 0.6)
+    if abs(S['trackPos']) > 0.9: brake = max(brake, 0.8)
+    return clip(brake, 0.0, 1.0)
 
 def shift_gears(S):
     gear = 1
     for i, speed in enumerate(GEAR_SPEEDS):
-        if S['speedX'] > speed:
-            gear = i + 1
+        if S['speedX'] > speed: gear = i+1
     return min(gear, 6)
 
 def traction_control(S, accel):
     if ENABLE_TRACTION_CONTROL:
-        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > 2:
-            accel -= 0.1
-    return max(0.0, accel)
+        slip = (S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])
+        if slip > 1.0: accel *= 0.5
+    return clip(accel, 0.0, 1.0)
+
+def recover_if_stuck(S, R):
+    STUCK_WHEEL_THRESHOLD = 2.0
+    STUCK_SPEED_THRESHOLD = 5.0
+    STUCK_TIMER_THRESHOLD = 25
+
+    wheel_slip = (S['wheelSpinVel'][2]+S['wheelSpinVel'][3])-(S['wheelSpinVel'][0]+S['wheelSpinVel'][1])
+    if (wheel_slip>STUCK_WHEEL_THRESHOLD and S['speedX']<STUCK_SPEED_THRESHOLD) or S.get('stucktimer',0)>STUCK_TIMER_THRESHOLD:
+        R['accel'] = 0.5
+        R['brake'] = 0.0
+        if S['speedX']<1.0: R['accel'] = -0.5
+        R['steer'] = -S['trackPos']*0.5
+        if S['speedX']<0.5: R['gear']=-1
+        return True
+    return False
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
     S, R = c.S.d, c.R.d
-    R['steer'] = calculate_steering(S)
-    R['accel'] = calculate_throttle(S, R)
-    R['brake'] = apply_brakes(S)
+
+    if recover_if_stuck(S, R):
+        return
+
+    target_steer = calculate_steering(S)
+    front_track_min = min(S['track'][:9])
+    damping = STEER_DAMPING
+    if front_track_min < 50 or abs(S['trackPos']) > 0.85: damping = 0.6
+    R['steer'] = R['steer']*(1-damping) + target_steer*damping
+
+    target_speed = calculate_dynamic_speed(S)
+    R['accel'] = calculate_throttle(S, R, target_speed)
+    R['brake'] = apply_brakes(S, target_speed)
     R['accel'] = traction_control(S, R['accel'])
     R['gear'] = shift_gears(S)
-    return
 
 # ================= MAIN LOOP =================
 if __name__ == "__main__":
